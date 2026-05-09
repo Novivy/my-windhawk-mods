@@ -153,6 +153,36 @@ With labels:
   $description: >-
     Hide the dot that appears on running app buttons. The progress indicator
     (shown during downloads etc.) is unaffected.
+- badgeRepositionEnabled: true
+  $name: Enable badge repositioning
+  $description: >-
+    Enable the custom badge (notification dot) positioning. Disable to revert
+    to Windows default behaviour and verify the dot is visible at all.
+- badgeOriginY: 0
+  $name: Badge pivot (x0.01, 0=auto)
+  $description: >-
+    Rotation pivot Y for notification badges (e.g. Discord's red dot). 0 =
+    automatic (75 without label, 125 with label). Otherwise the value is
+    divided by 100: e.g. 75 = 0.75. Only change this if the badge is in the
+    wrong corner.
+- badgeOffsetX: 0
+  $name: Badge down/up offset
+  $description: >-
+    Moves the notification badge (e.g. Discord red dot) up or down on screen.
+    Positive = down, negative = up. Start around 5-15 to bring the badge into
+    view, then fine-tune.
+- badgeOffsetY: 0
+  $name: Badge left/right offset
+  $description: >-
+    Moves the notification badge left or right on screen. Positive = toward the
+    taskbar edge (left for a left taskbar), negative = away from it (right).
+    Fine-tune after setting the up/down position.
+- badgeSize: 0
+  $name: Badge size (%)
+  $description: >-
+    Scale percentage for the notification badge (e.g. Discord red dot). 0 =
+    default (100%). Use 80 for 80% size, 120 for 120%, etc. Reducing the size
+    can fix blurriness. After changing this, re-tune the offset settings.
 */
 // ==/WindhawkModSettings==
 
@@ -220,6 +250,11 @@ struct {
     int taskbarLabelLeftPadding;
     int taskbarLabelWidthExtra;
     bool hideRunningIndicator;
+    bool badgeRepositionEnabled;
+    int badgeOriginY;
+    int badgeOffsetX;
+    int badgeOffsetY;
+    int badgeSize;
 } g_settings;
 
 constexpr int kDefaultClockContainerHeight = 40;
@@ -2371,20 +2406,45 @@ void UpdateTaskListButton(FrameworkElement taskListButtonElement) {
              L"BadgeControl",
          }) {
         auto badgeElement = FindChildByName(iconPanelElement, badgeElementName);
-        if (badgeElement) {
-            double angle = g_unloading ? 0 : -90;
-            Media::RotateTransform transform;
-            transform.Angle(angle);
-            badgeElement.RenderTransform(transform);
+        if (badgeElement && (g_unloading || g_settings.badgeRepositionEnabled)) {
+            badgeElement.UseLayoutRounding(true);
+
+            // CompositeTransform combines scale + rotation in one RenderTransform.
+            // This avoids needing ActualWidth/Height (which are 0 at hook time).
+            Media::CompositeTransform compositeTransform;
+            if (!g_unloading) {
+                compositeTransform.Rotation(-90);
+                float scale = g_settings.badgeSize > 0
+                                  ? g_settings.badgeSize / 100.0f
+                                  : 1.0f;
+                compositeTransform.ScaleX(scale);
+                compositeTransform.ScaleY(scale);
+            }
+            badgeElement.RenderTransform(compositeTransform);
 
             winrt::Windows::Foundation::Point origin{};
             if (!g_unloading) {
-                origin.Y = labelControlElement ? 1.25 : 0.75;
+                double defaultOriginY = labelControlElement ? 1.25 : 0.75;
+                origin.Y = g_settings.badgeOriginY != 0
+                               ? g_settings.badgeOriginY / 100.0
+                               : defaultOriginY;
             }
-
             badgeElement.RenderTransformOrigin(origin);
 
             badgeElement.Margin(margin);
+
+            if (g_unloading) {
+                badgeElement.Translation(
+                    winrt::Windows::Foundation::Numerics::float3::zero());
+                badgeElement.Scale(
+                    winrt::Windows::Foundation::Numerics::float3::one());
+            } else {
+                badgeElement.Translation({(float)g_settings.badgeOffsetX,
+                                          (float)g_settings.badgeOffsetY,
+                                          0.0f});
+                badgeElement.Scale(
+                    winrt::Windows::Foundation::Numerics::float3::one());
+            }
         }
     }
 
@@ -4525,6 +4585,11 @@ void LoadSettings() {
     g_settings.taskbarLabelLeftPadding = Wh_GetIntSetting(L"TaskbarLabelLeftPadding");
     g_settings.taskbarLabelWidthExtra = Wh_GetIntSetting(L"TaskbarLabelWidthExtra");
     g_settings.hideRunningIndicator = Wh_GetIntSetting(L"hideRunningIndicator");
+    g_settings.badgeRepositionEnabled = Wh_GetIntSetting(L"badgeRepositionEnabled");
+    g_settings.badgeOriginY = Wh_GetIntSetting(L"badgeOriginY");
+    g_settings.badgeOffsetX = Wh_GetIntSetting(L"badgeOffsetX");
+    g_settings.badgeOffsetY = Wh_GetIntSetting(L"badgeOffsetY");
+    g_settings.badgeSize = Wh_GetIntSetting(L"badgeSize");
 }
 
 void ApplySettings(bool settingsChanged = false) {
