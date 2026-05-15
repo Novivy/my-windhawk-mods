@@ -183,6 +183,29 @@ With labels:
     Scale percentage for the notification badge (e.g. Discord red dot). 0 =
     default (100%). Use 80 for 80% size, 120 for 120%, etc. Reducing the size
     can fix blurriness. After changing this, re-tune the offset settings.
+- processColorRules:
+  - - process: ""
+      $name: Process / app name
+      $description: >-
+        A string to match against the button's automation ID, automation name,
+        or label text. Case-insensitive, partial match allowed. After loading
+        the mod, check the Windhawk log to see exactly what each button
+        exposes, then type any substring of that (e.g. chrome, code, firefox).
+    - color: ""
+      $name: Background color
+      $description: >-
+        Hex color in #RRGGBB or #AARRGGBB format. #RRGGBB is fully opaque,
+        #AARRGGBB includes an alpha channel. Examples: #FF0000 red,
+        #8000FF00 semi-transparent green.
+    - textColor: ""
+      $name: Text color
+      $description: >-
+        Hex color for the label text, same format as background color.
+        Leave empty to keep the default text color.
+  $name: Process background color rules
+  $description: >-
+    Assign a custom background and/or text color to taskbar items by process
+    name. Add one entry per process you want to color.
 */
 // ==/WindhawkModSettings==
 
@@ -200,7 +223,9 @@ With labels:
 #undef GetCurrentTime
 
 #include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/Windows.UI.Core.h>
+#include <winrt/Windows.UI.Xaml.Automation.h>
 #include <winrt/Windows.UI.Xaml.Controls.h>
 #include <winrt/Windows.UI.Xaml.Media.h>
 
@@ -234,6 +259,13 @@ enum class StartMenuAlignment {
     bottom,
 };
 
+struct ProcessColorRule {
+    std::wstring process;  // lowercase
+    winrt::Windows::UI::Color color;
+    bool hasTextColor = false;
+    winrt::Windows::UI::Color textColor;
+};
+
 struct {
     TaskbarLocation taskbarLocation;
     TaskbarLocation taskbarLocationSecondary;
@@ -255,6 +287,7 @@ struct {
     int badgeOffsetX;
     int badgeOffsetY;
     int badgeSize;
+    std::vector<ProcessColorRule> processColorRules;
 } g_settings;
 
 constexpr int kDefaultClockContainerHeight = 40;
@@ -2409,6 +2442,16 @@ void UpdateTaskListButton(FrameworkElement taskListButtonElement) {
         if (badgeElement && (g_unloading || g_settings.badgeRepositionEnabled)) {
             badgeElement.UseLayoutRounding(true);
 
+            if (g_unloading) {
+                badgeElement.CacheMode(nullptr);
+            } else {
+                // BitmapCache renders the badge to a GPU texture first, then
+                // applies the rotation transform on that texture. For an exact
+                // 90-degree rotation this is pixel-perfect and eliminates the
+                // blurriness from multi-layer compositing.
+                badgeElement.CacheMode(Media::BitmapCache{});
+            }
+
             // CompositeTransform combines scale + rotation in one RenderTransform.
             // This avoids needing ActualWidth/Height (which are 0 at hook time).
             Media::CompositeTransform compositeTransform;
@@ -2504,6 +2547,138 @@ void UpdateTaskListButton(FrameworkElement taskListButtonElement) {
     } else if (g_unloading) {
         taskListButtonElement.as<DependencyObject>().ClearValue(
             FrameworkElement::WidthProperty());
+    }
+
+    // Apply per-process background color.
+    // We insert a hit-test-invisible child Grid at z-index 0 inside IconPanel
+    // rather than setting Panel.Background directly. This keeps the background
+    // purely visual so the button's own click/activation handling is unaffected.
+    if (auto panel = iconPanelElement.try_as<Controls::Panel>()) {
+        auto children = panel.Children();
+        constexpr PCWSTR kBgTag = L"wb_proc_bg";
+
+        // Always remove the previously injected element first.
+        if (children.Size() > 0) {
+            if (auto first = children.GetAt(0).try_as<FrameworkElement>()) {
+                if (winrt::unbox_value_or<winrt::hstring>(first.Tag(), {}) ==
+                    kBgTag) {
+                    children.RemoveAt(0);
+                }
+            }
+        }
+
+        if (!g_unloading && !g_settings.processColorRules.empty()) {
+            // Collect every string identifier available on this button.
+            std::wstring automationId;
+            std::wstring automationName;
+            std::wstring labelText;
+
+            {
+                auto v = winrt::Windows::UI::Xaml::Automation::
+                    AutomationProperties::GetAutomationId(taskListButtonElement);
+                if (!v.empty()) automationId = v.c_str();
+            }
+            {
+                auto v = winrt::Windows::UI::Xaml::Automation::
+                    AutomationProperties::GetName(taskListButtonElement);
+                if (!v.empty()) automationName = v.c_str();
+            }
+            if (labelControlElement) {
+                if (auto tb =
+                        labelControlElement.try_as<Controls::TextBlock>()) {
+                    auto v = tb.Text();
+                    if (!v.empty()) labelText = v.c_str();
+                }
+            }
+
+            // automationId: contains match (stable ID, not user-visible text).
+            auto matchesId = [](std::wstring candidate,
+                                const ProcessColorRule& rule) {
+                if (candidate.empty()) return false;
+                auto slash = candidate.rfind(L'\\');
+                if (slash != std::wstring::npos) {
+                    candidate = candidate.substr(slash + 1);
+                }
+                for (auto& c : candidate) c = towlower(c);
+                return candidate == rule.process ||
+                       candidate.find(rule.process) != std::wstring::npos;
+            };
+
+            // Ends-with: preferred strategy, avoids "Firefox loading Discord.com"
+            // matching the discord rule (app name is at the end of the label).
+            auto endsWithRule = [](const std::wstring& candidate,
+                                   const ProcessColorRule& rule) {
+                if (candidate.empty() ||
+                    candidate.size() < rule.process.size()) {
+                    return false;
+                }
+                std::wstring lower = candidate;
+                for (auto& c : lower) c = towlower(c);
+                return lower.compare(lower.size() - rule.process.size(),
+                                     rule.process.size(),
+                                     rule.process) == 0;
+            };
+
+            // Starts-with: fallback for apps that put their name first, e.g.
+            // SQLyog ("SQLyog Ultimate 64 - [connection]") or CLion.
+            auto startsWithRule = [](const std::wstring& candidate,
+                                     const ProcessColorRule& rule) {
+                if (candidate.empty() ||
+                    candidate.size() < rule.process.size()) {
+                    return false;
+                }
+                std::wstring lower = candidate;
+                for (auto& c : lower) c = towlower(c);
+                return lower.compare(0, rule.process.size(),
+                                     rule.process) == 0;
+            };
+
+            const ProcessColorRule* matched = nullptr;
+
+            // Pass 1: automationId contains OR label/name ends-with.
+            for (const auto& rule : g_settings.processColorRules) {
+                if (matchesId(automationId, rule) ||
+                    endsWithRule(automationName, rule) ||
+                    endsWithRule(labelText, rule)) {
+                    matched = &rule;
+                    break;
+                }
+            }
+
+            // Pass 2: label/name starts-with (only if pass 1 found nothing).
+            if (!matched) {
+                for (const auto& rule : g_settings.processColorRules) {
+                    if (startsWithRule(automationName, rule) ||
+                        startsWithRule(labelText, rule)) {
+                        matched = &rule;
+                        break;
+                    }
+                }
+            }
+
+            if (matched) {
+                Media::SolidColorBrush brush;
+                brush.Color(matched->color);
+                Controls::Grid bgRect;
+                bgRect.Tag(winrt::box_value(winrt::hstring(kBgTag)));
+                bgRect.IsHitTestVisible(false);
+                bgRect.Background(brush);
+                children.InsertAt(0, bgRect.as<UIElement>());
+            }
+
+            // Apply or clear text color on the label.
+            if (labelControlElement) {
+                if (matched && matched->hasTextColor) {
+                    Media::SolidColorBrush textBrush;
+                    textBrush.Color(matched->textColor);
+                    labelControlElement.as<DependencyObject>().SetValue(
+                        Controls::Control::ForegroundProperty(), textBrush);
+                } else {
+                    labelControlElement.as<DependencyObject>().ClearValue(
+                        Controls::Control::ForegroundProperty());
+                }
+            }
+        }
     }
 }
 
@@ -4590,6 +4765,69 @@ void LoadSettings() {
     g_settings.badgeOffsetX = Wh_GetIntSetting(L"badgeOffsetX");
     g_settings.badgeOffsetY = Wh_GetIntSetting(L"badgeOffsetY");
     g_settings.badgeSize = Wh_GetIntSetting(L"badgeSize");
+
+    g_settings.processColorRules.clear();
+
+    auto parseHexColor = [](PCWSTR colorStr, winrt::Windows::UI::Color& out) {
+        if (!colorStr || colorStr[0] != L'#') return false;
+        PCWSTR hex = colorStr + 1;
+        WCHAR* end = nullptr;
+        unsigned long value = wcstoul(hex, &end, 16);
+        ptrdiff_t len = end - hex;
+        if (len == 6) {
+            out.A = 255;
+            out.R = (value >> 16) & 0xFF;
+            out.G = (value >> 8) & 0xFF;
+            out.B = value & 0xFF;
+            return true;
+        } else if (len == 8) {
+            out.A = (value >> 24) & 0xFF;
+            out.R = (value >> 16) & 0xFF;
+            out.G = (value >> 8) & 0xFF;
+            out.B = value & 0xFF;
+            return true;
+        }
+        return false;
+    };
+
+    for (int i = 0; ; i++) {
+        WCHAR processKey[64], colorKey[64], textColorKey[64];
+        swprintf_s(processKey, ARRAYSIZE(processKey),
+                   L"processColorRules[%d].process", i);
+        swprintf_s(colorKey, ARRAYSIZE(colorKey),
+                   L"processColorRules[%d].color", i);
+        swprintf_s(textColorKey, ARRAYSIZE(textColorKey),
+                   L"processColorRules[%d].textColor", i);
+
+        PCWSTR process = Wh_GetStringSetting(processKey);
+        bool empty = !process || !*process;
+        Wh_FreeStringSetting(process);
+        if (empty) {
+            break;
+        }
+
+        process = Wh_GetStringSetting(processKey);
+        std::wstring processLower = process;
+        Wh_FreeStringSetting(process);
+        for (auto& c : processLower) {
+            c = towlower(c);
+        }
+
+        PCWSTR colorStr = Wh_GetStringSetting(colorKey);
+        winrt::Windows::UI::Color color{};
+        bool colorValid = parseHexColor(colorStr, color);
+        Wh_FreeStringSetting(colorStr);
+
+        PCWSTR textColorStr = Wh_GetStringSetting(textColorKey);
+        winrt::Windows::UI::Color textColor{};
+        bool hasTextColor = parseHexColor(textColorStr, textColor);
+        Wh_FreeStringSetting(textColorStr);
+
+        if (colorValid && !processLower.empty()) {
+            g_settings.processColorRules.push_back(
+                {std::move(processLower), color, hasTextColor, textColor});
+        }
+    }
 }
 
 void ApplySettings(bool settingsChanged = false) {
