@@ -12,7 +12,7 @@
 // @include         ShellExperienceHost.exe
 // @include         ShellHost.exe
 // @architecture    x86-64
-// @compilerOptions -ldwmapi -lole32 -loleaut32 -lruntimeobject -lshcore
+// @compilerOptions -ldwmapi -lole32 -loleaut32 -lruntimeobject -lshcore -lversion
 // ==/WindhawkMod==
 
 
@@ -302,6 +302,7 @@ enum class Target {
 Target g_target;
 
 std::atomic<bool> g_taskbarViewDllLoaded;
+std::atomic<bool> g_systemTrayModuleHooked;
 std::atomic<bool> g_applyingSettings;
 std::atomic<bool> g_pendingMeasureOverride;
 std::atomic<bool> g_unloading;
@@ -4902,7 +4903,98 @@ void ApplySettings(bool settingsChanged = false) {
     }
 }
 
-bool HookTaskbarViewDllSymbols(HMODULE module) {
+bool HookSystemTraySymbols(HMODULE module) {
+    // SystemTray.dll (on Taskbar.View.dll 2604+, the SystemTray types moved
+    // here out of Taskbar.View.dll).
+    WindhawkUtils::SYMBOL_HOOK symbolHooks[] = {
+        {
+            {LR"(private: double __cdecl winrt::SystemTray::implementation::SystemTrayController::GetFrameSize(enum winrt::WindowsUdk::UI::Shell::TaskbarSize))"},
+            &SystemTrayController_GetFrameSize_Original,
+            SystemTrayController_GetFrameSize_Hook,
+            true,  // From Windows 11 version 22H2, inlined sometimes.
+        },
+        {
+            {LR"(private: double __cdecl winrt::SystemTray::implementation::SystemTraySecondaryController::GetFrameSize(enum winrt::WindowsUdk::UI::Shell::TaskbarSize))"},
+            &SystemTraySecondaryController_GetFrameSize_Original,
+            SystemTraySecondaryController_GetFrameSize_Hook,
+            true,  // Missing in very old build (end of 2023).
+        },
+        {
+            {LR"(private: void __cdecl winrt::SystemTray::implementation::SystemTrayController::UpdateFrameSize(void))"},
+            &SystemTrayController_UpdateFrameSize_SymbolAddress,
+            nullptr,  // Hooked manually, we need the symbol address.
+        },
+        {
+            {LR"(private: void __cdecl winrt::SystemTray::implementation::SystemTraySecondaryController::UpdateFrameSize(void))"},
+            &SystemTraySecondaryController_UpdateFrameSize_Original,
+            SystemTraySecondaryController_UpdateFrameSize_Hook,
+        },
+        {
+            {LR"(public: __cdecl winrt::impl::consume_Windows_UI_Xaml_IFrameworkElement<struct winrt::SystemTray::SystemTrayFrame>::Height(double)const )"},
+            &SystemTrayFrame_Height_Original,
+            SystemTrayFrame_Height_Hook,
+        },
+        {
+            {LR"(public: virtual int __cdecl winrt::impl::produce<struct winrt::SystemTray::implementation::SystemTrayFrame,struct winrt::Windows::UI::Xaml::IFrameworkElementOverrides>::MeasureOverride(struct winrt::Windows::Foundation::Size,struct winrt::Windows::Foundation::Size *))"},
+            &SystemTrayFrame_MeasureOverride_Original,
+            SystemTrayFrame_MeasureOverride_Hook,
+        },
+        {
+            {LR"(public: __cdecl winrt::SystemTray::implementation::IconView::IconView(void))"},
+            &IconView_IconView_Original,
+            IconView_IconView_Hook,
+        },
+        {
+            {LR"(public: void __cdecl winrt::SystemTray::implementation::DateTimeIconContent::OnApplyTemplate(void))"},
+            &DateTimeIconContent_OnApplyTemplate_Original,
+            DateTimeIconContent_OnApplyTemplate_Hook,
+        },
+        {
+            {LR"(private: void __cdecl winrt::SystemTray::implementation::CopilotIcon::UpdateVisualStates(void))"},
+            &CopilotIcon_UpdateVisualStates_Original,
+            CopilotIcon_UpdateVisualStates_Hook,
+            true,  // Removed in insider builds around KB5046756.
+        },
+        {
+            {LR"(private: void __cdecl winrt::SystemTray::implementation::CopilotIcon::ToggleEdgeCopilot(void))"},
+            &CopilotIcon_ToggleEdgeCopilot_Original,
+            CopilotIcon_ToggleEdgeCopilot_Hook,
+            true,  // Removed in insider builds around KB5046756.
+        },
+        {
+            {LR"(private: struct winrt::Windows::Foundation::Point __cdecl winrt::SystemTray::implementation::NotificationAreaIconsDataModel::GetInvocationPointRelativeToScreen(struct winrt::Windows::Foundation::Point const &))"},
+            &NotificationAreaIconsDataModel_GetInvocationPointRelativeToScreen_Original,
+            NotificationAreaIconsDataModel_GetInvocationPointRelativeToScreen_Hook,
+        },
+        {
+            {LR"(private: struct tagPOINT __cdecl winrt::SystemTray::implementation::DragDropManager::ElementPointToScreenPoint(struct winrt::SystemTray::implementation::NotifyIconView const &,struct HWND__ *,struct winrt::Windows::UI::Xaml::Input::PointerRoutedEventArgs const &))"},
+            &DragDropManager_ElementPointToScreenPoint_Original,
+            DragDropManager_ElementPointToScreenPoint_Hook,
+        },
+        {
+            {LR"(private: struct tagRECT __cdecl winrt::SystemTray::implementation::DragDropManager::ScreenRectForElement(struct winrt::Windows::UI::Xaml::FrameworkElement const &,struct HWND__ *))"},
+            &DragDropManager_ScreenRectForElement_Original,
+            DragDropManager_ScreenRectForElement_Hook,
+        },
+    };
+
+    if (!HookSymbols(module, symbolHooks, ARRAYSIZE(symbolHooks))) {
+        Wh_Log(L"HookSymbols failed");
+        return false;
+    }
+
+    if (SystemTrayController_UpdateFrameSize_SymbolAddress) {
+        WindhawkUtils::SetFunctionHook(
+            SystemTrayController_UpdateFrameSize_SymbolAddress,
+            SystemTrayController_UpdateFrameSize_Hook,
+            &SystemTrayController_UpdateFrameSize_Original);
+    }
+
+    return true;
+}
+
+bool HookTaskbarViewDllSymbols(HMODULE module,
+                               bool hookSystemTraySymbolsInline) {
     // Taskbar.View.dll, ExplorerExtensions.dll
     WindhawkUtils::SYMBOL_HOOK symbolHooks[] =  //
         {
@@ -4910,18 +5002,6 @@ bool HookTaskbarViewDllSymbols(HMODULE module) {
                 {LR"(public: __cdecl winrt::impl::consume_Windows_Foundation_Collections_IMap<struct winrt::Windows::UI::Xaml::ResourceDictionary,struct winrt::Windows::Foundation::IInspectable,struct winrt::Windows::Foundation::IInspectable>::Lookup(struct winrt::Windows::Foundation::IInspectable const &)const )"},
                 &ResourceDictionary_Lookup_Original,
                 ResourceDictionary_Lookup_Hook,
-            },
-            {
-                {LR"(private: double __cdecl winrt::SystemTray::implementation::SystemTrayController::GetFrameSize(enum winrt::WindowsUdk::UI::Shell::TaskbarSize))"},
-                &SystemTrayController_GetFrameSize_Original,
-                SystemTrayController_GetFrameSize_Hook,
-                true,  // From Windows 11 version 22H2, inlined sometimes.
-            },
-            {
-                {LR"(private: double __cdecl winrt::SystemTray::implementation::SystemTraySecondaryController::GetFrameSize(enum winrt::WindowsUdk::UI::Shell::TaskbarSize))"},
-                &SystemTraySecondaryController_GetFrameSize_Original,
-                SystemTraySecondaryController_GetFrameSize_Hook,
-                true,  // Missing in very old build (end of 2023).
             },
             {
                 {LR"(public: static double __cdecl winrt::Taskbar::implementation::TaskbarConfiguration::GetFrameSize(enum winrt::WindowsUdk::UI::Shell::TaskbarSize))"},
@@ -4945,11 +5025,6 @@ bool HookTaskbarViewDllSymbols(HMODULE module) {
             },
 #endif
             {
-                {LR"(private: void __cdecl winrt::SystemTray::implementation::SystemTrayController::UpdateFrameSize(void))"},
-                &SystemTrayController_UpdateFrameSize_SymbolAddress,
-                nullptr,  // Hooked manually, we need the symbol address.
-            },
-            {
                 {LR"(private: void __cdecl winrt::Taskbar::implementation::TaskbarController::OnGroupingModeChanged(void))"},
                 &TaskbarController_OnGroupingModeChanged,
             },
@@ -4963,24 +5038,9 @@ bool HookTaskbarViewDllSymbols(HMODULE module) {
                 TaskbarController_UpdateFrameHeight_Hook,
             },
             {
-                {LR"(private: void __cdecl winrt::SystemTray::implementation::SystemTraySecondaryController::UpdateFrameSize(void))"},
-                &SystemTraySecondaryController_UpdateFrameSize_Original,
-                SystemTraySecondaryController_UpdateFrameSize_Hook,
-            },
-            {
-                {LR"(public: __cdecl winrt::impl::consume_Windows_UI_Xaml_IFrameworkElement<struct winrt::SystemTray::SystemTrayFrame>::Height(double)const )"},
-                &SystemTrayFrame_Height_Original,
-                SystemTrayFrame_Height_Hook,
-            },
-            {
                 {LR"(public: virtual int __cdecl winrt::impl::produce<struct winrt::Taskbar::implementation::TaskbarFrame,struct winrt::Windows::UI::Xaml::IFrameworkElementOverrides>::MeasureOverride(struct winrt::Windows::Foundation::Size,struct winrt::Windows::Foundation::Size *))"},
                 &TaskbarFrame_MeasureOverride_Original,
                 TaskbarFrame_MeasureOverride_Hook,
-            },
-            {
-                {LR"(public: virtual int __cdecl winrt::impl::produce<struct winrt::SystemTray::implementation::SystemTrayFrame,struct winrt::Windows::UI::Xaml::IFrameworkElementOverrides>::MeasureOverride(struct winrt::Windows::Foundation::Size,struct winrt::Windows::Foundation::Size *))"},
-                &SystemTrayFrame_MeasureOverride_Original,
-                SystemTrayFrame_MeasureOverride_Hook,
             },
             {
                 {LR"(protected: virtual void __cdecl winrt::Taskbar::implementation::AugmentedEntryPointButton::UpdateButtonPadding(void))"},
@@ -4991,16 +5051,6 @@ bool HookTaskbarViewDllSymbols(HMODULE module) {
                 {LR"(public: __cdecl winrt::impl::consume_Windows_UI_Xaml_IFrameworkElement<struct winrt::Windows::UI::Xaml::Controls::Primitives::RepeatButton>::Width(double)const )"},
                 &RepeatButton_Width_Original,
                 RepeatButton_Width_Hook,
-            },
-            {
-                {LR"(public: __cdecl winrt::SystemTray::implementation::IconView::IconView(void))"},
-                &IconView_IconView_Original,
-                IconView_IconView_Hook,
-            },
-            {
-                {LR"(public: void __cdecl winrt::SystemTray::implementation::DateTimeIconContent::OnApplyTemplate(void))"},
-                &DateTimeIconContent_OnApplyTemplate_Original,
-                DateTimeIconContent_OnApplyTemplate_Hook,
             },
             {
                 {LR"(private: void __cdecl winrt::Taskbar::implementation::TaskListButton::UpdateVisualStates(void))"},
@@ -5028,36 +5078,9 @@ bool HookTaskbarViewDllSymbols(HMODULE module) {
                 OverflowFlyoutList_OnApplyTemplate_Hook,
             },
             {
-                {LR"(private: void __cdecl winrt::SystemTray::implementation::CopilotIcon::UpdateVisualStates(void))"},
-                &CopilotIcon_UpdateVisualStates_Original,
-                CopilotIcon_UpdateVisualStates_Hook,
-                true,  // Removed in insider builds around KB5046756.
-            },
-            {
-                {LR"(private: void __cdecl winrt::SystemTray::implementation::CopilotIcon::ToggleEdgeCopilot(void))"},
-                &CopilotIcon_ToggleEdgeCopilot_Original,
-                CopilotIcon_ToggleEdgeCopilot_Hook,
-                true,  // Removed in insider builds around KB5046756.
-            },
-            {
                 {LR"(public: void __cdecl winrt::Taskbar::implementation::OverflowFlyoutModel::Show(void))"},
                 &OverflowFlyoutModel_Show_Original,
                 OverflowFlyoutModel_Show_Hook,
-            },
-            {
-                {LR"(private: struct winrt::Windows::Foundation::Point __cdecl winrt::SystemTray::implementation::NotificationAreaIconsDataModel::GetInvocationPointRelativeToScreen(struct winrt::Windows::Foundation::Point const &))"},
-                &NotificationAreaIconsDataModel_GetInvocationPointRelativeToScreen_Original,
-                NotificationAreaIconsDataModel_GetInvocationPointRelativeToScreen_Hook,
-            },
-            {
-                {LR"(private: struct tagPOINT __cdecl winrt::SystemTray::implementation::DragDropManager::ElementPointToScreenPoint(struct winrt::SystemTray::implementation::NotifyIconView const &,struct HWND__ *,struct winrt::Windows::UI::Xaml::Input::PointerRoutedEventArgs const &))"},
-                &DragDropManager_ElementPointToScreenPoint_Original,
-                DragDropManager_ElementPointToScreenPoint_Hook,
-            },
-            {
-                {LR"(private: struct tagRECT __cdecl winrt::SystemTray::implementation::DragDropManager::ScreenRectForElement(struct winrt::Windows::UI::Xaml::FrameworkElement const &,struct HWND__ *))"},
-                &DragDropManager_ScreenRectForElement_Original,
-                DragDropManager_ScreenRectForElement_Hook,
             },
             {
                 {LR"(private: void __cdecl winrt::Taskbar::implementation::FlyoutFrame::UpdateFlyoutPosition(void))"},
@@ -5073,7 +5096,101 @@ bool HookTaskbarViewDllSymbols(HMODULE module) {
             },
         };
 
-    if (!HookSymbols(module, symbolHooks, ARRAYSIZE(symbolHooks))) {
+    // On older Taskbar.View.dll versions (before the SystemTray types moved
+    // out into SystemTray.dll), these SystemTray symbols live in
+    // Taskbar.View.dll itself, so include them in the same hook batch when
+    // hookSystemTraySymbolsInline is set.
+    WindhawkUtils::SYMBOL_HOOK symbolHooksSystemTray[] = {
+        {
+            {LR"(private: double __cdecl winrt::SystemTray::implementation::SystemTrayController::GetFrameSize(enum winrt::WindowsUdk::UI::Shell::TaskbarSize))"},
+            &SystemTrayController_GetFrameSize_Original,
+            SystemTrayController_GetFrameSize_Hook,
+            true,  // From Windows 11 version 22H2, inlined sometimes.
+        },
+        {
+            {LR"(private: double __cdecl winrt::SystemTray::implementation::SystemTraySecondaryController::GetFrameSize(enum winrt::WindowsUdk::UI::Shell::TaskbarSize))"},
+            &SystemTraySecondaryController_GetFrameSize_Original,
+            SystemTraySecondaryController_GetFrameSize_Hook,
+            true,  // Missing in very old build (end of 2023).
+        },
+        {
+            {LR"(private: void __cdecl winrt::SystemTray::implementation::SystemTrayController::UpdateFrameSize(void))"},
+            &SystemTrayController_UpdateFrameSize_SymbolAddress,
+            nullptr,  // Hooked manually, we need the symbol address.
+        },
+        {
+            {LR"(private: void __cdecl winrt::SystemTray::implementation::SystemTraySecondaryController::UpdateFrameSize(void))"},
+            &SystemTraySecondaryController_UpdateFrameSize_Original,
+            SystemTraySecondaryController_UpdateFrameSize_Hook,
+        },
+        {
+            {LR"(public: __cdecl winrt::impl::consume_Windows_UI_Xaml_IFrameworkElement<struct winrt::SystemTray::SystemTrayFrame>::Height(double)const )"},
+            &SystemTrayFrame_Height_Original,
+            SystemTrayFrame_Height_Hook,
+        },
+        {
+            {LR"(public: virtual int __cdecl winrt::impl::produce<struct winrt::SystemTray::implementation::SystemTrayFrame,struct winrt::Windows::UI::Xaml::IFrameworkElementOverrides>::MeasureOverride(struct winrt::Windows::Foundation::Size,struct winrt::Windows::Foundation::Size *))"},
+            &SystemTrayFrame_MeasureOverride_Original,
+            SystemTrayFrame_MeasureOverride_Hook,
+        },
+        {
+            {LR"(public: __cdecl winrt::SystemTray::implementation::IconView::IconView(void))"},
+            &IconView_IconView_Original,
+            IconView_IconView_Hook,
+        },
+        {
+            {LR"(public: void __cdecl winrt::SystemTray::implementation::DateTimeIconContent::OnApplyTemplate(void))"},
+            &DateTimeIconContent_OnApplyTemplate_Original,
+            DateTimeIconContent_OnApplyTemplate_Hook,
+        },
+        {
+            {LR"(private: void __cdecl winrt::SystemTray::implementation::CopilotIcon::UpdateVisualStates(void))"},
+            &CopilotIcon_UpdateVisualStates_Original,
+            CopilotIcon_UpdateVisualStates_Hook,
+            true,  // Removed in insider builds around KB5046756.
+        },
+        {
+            {LR"(private: void __cdecl winrt::SystemTray::implementation::CopilotIcon::ToggleEdgeCopilot(void))"},
+            &CopilotIcon_ToggleEdgeCopilot_Original,
+            CopilotIcon_ToggleEdgeCopilot_Hook,
+            true,  // Removed in insider builds around KB5046756.
+        },
+        {
+            {LR"(private: struct winrt::Windows::Foundation::Point __cdecl winrt::SystemTray::implementation::NotificationAreaIconsDataModel::GetInvocationPointRelativeToScreen(struct winrt::Windows::Foundation::Point const &))"},
+            &NotificationAreaIconsDataModel_GetInvocationPointRelativeToScreen_Original,
+            NotificationAreaIconsDataModel_GetInvocationPointRelativeToScreen_Hook,
+        },
+        {
+            {LR"(private: struct tagPOINT __cdecl winrt::SystemTray::implementation::DragDropManager::ElementPointToScreenPoint(struct winrt::SystemTray::implementation::NotifyIconView const &,struct HWND__ *,struct winrt::Windows::UI::Xaml::Input::PointerRoutedEventArgs const &))"},
+            &DragDropManager_ElementPointToScreenPoint_Original,
+            DragDropManager_ElementPointToScreenPoint_Hook,
+        },
+        {
+            {LR"(private: struct tagRECT __cdecl winrt::SystemTray::implementation::DragDropManager::ScreenRectForElement(struct winrt::Windows::UI::Xaml::FrameworkElement const &,struct HWND__ *))"},
+            &DragDropManager_ScreenRectForElement_Original,
+            DragDropManager_ScreenRectForElement_Hook,
+        },
+    };
+
+    // Combine the two batches into one HookSymbols call. On newer builds only
+    // the Taskbar.View.dll batch is used; on older builds the SystemTray batch
+    // is appended because those symbols still live in Taskbar.View.dll.
+    using COMBINED_SH = WindhawkUtils::SYMBOL_HOOK;
+    COMBINED_SH allHooks[  //
+        ARRAYSIZE(symbolHooks) + ARRAYSIZE(symbolHooksSystemTray)];
+    int index = 0;
+
+    for (auto& hook : symbolHooks) {
+        allHooks[index++] = std::move(hook);
+    }
+
+    if (hookSystemTraySymbolsInline) {
+        for (auto& hook : symbolHooksSystemTray) {
+            allHooks[index++] = std::move(hook);
+        }
+    }
+
+    if (!HookSymbols(module, allHooks, index)) {
         Wh_Log(L"HookSymbols failed");
         return false;
     }
@@ -5087,7 +5204,8 @@ bool HookTaskbarViewDllSymbols(HMODULE module) {
     }
 #endif
 
-    if (SystemTrayController_UpdateFrameSize_SymbolAddress) {
+    if (hookSystemTraySymbolsInline &&
+        SystemTrayController_UpdateFrameSize_SymbolAddress) {
         WindhawkUtils::SetFunctionHook(
             SystemTrayController_UpdateFrameSize_SymbolAddress,
             SystemTrayController_UpdateFrameSize_Hook,
@@ -5095,6 +5213,33 @@ bool HookTaskbarViewDllSymbols(HMODULE module) {
     }
 
     return true;
+}
+
+VS_FIXEDFILEINFO* GetModuleVersionInfo(HMODULE hModule, UINT* puPtrLen) {
+    void* pFixedFileInfo = nullptr;
+    UINT uPtrLen = 0;
+
+    HRSRC hResource =
+        FindResource(hModule, MAKEINTRESOURCE(VS_VERSION_INFO), RT_VERSION);
+    if (hResource) {
+        HGLOBAL hGlobal = LoadResource(hModule, hResource);
+        if (hGlobal) {
+            void* pData = LockResource(hGlobal);
+            if (pData) {
+                if (!VerQueryValue(pData, L"\\", &pFixedFileInfo, &uPtrLen) ||
+                    uPtrLen == 0) {
+                    pFixedFileInfo = nullptr;
+                    uPtrLen = 0;
+                }
+            }
+        }
+    }
+
+    if (puPtrLen) {
+        *puPtrLen = uPtrLen;
+    }
+
+    return (VS_FIXEDFILEINFO*)pFixedFileInfo;
 }
 
 HMODULE GetTaskbarViewModuleHandle() {
@@ -5106,12 +5251,58 @@ HMODULE GetTaskbarViewModuleHandle() {
     return module;
 }
 
-void HandleLoadedModuleIfTaskbarView(HMODULE module, LPCWSTR lpLibFileName) {
+HMODULE GetSystemTrayModuleHandle() {
+    HMODULE module = GetModuleHandle(L"SystemTray.dll");
+    if (!module) {
+        module = GetModuleHandle(L"Taskbar.View.dll");
+        if (module) {
+            // Starting with Taskbar.View.dll 2604.8002.200.6000, the SystemTray
+            // types moved out of Taskbar.View.dll into SystemTray.dll, so don't
+            // treat Taskbar.View.dll as the host at this version and above.
+            VS_FIXEDFILEINFO* fixedFileInfo =
+                GetModuleVersionInfo(module, nullptr);
+            WORD moduleMajor =
+                fixedFileInfo ? HIWORD(fixedFileInfo->dwFileVersionMS) : 0;
+            if (!moduleMajor || moduleMajor >= 2604) {
+                Wh_Log(L"Skipping Taskbar.View.dll version %d", moduleMajor);
+                module = nullptr;
+            }
+        }
+    }
+    if (!module) {
+        module = GetModuleHandle(L"ExplorerExtensions.dll");
+    }
+
+    return module;
+}
+
+void HandleLoadedModuleIfSystemTrayOrTaskbarView(HMODULE module,
+                                                 LPCWSTR lpLibFileName) {
+    // SystemTray.dll - skipped here when the resolved module is actually an
+    // older Taskbar.View.dll (the block below hooks both in a single batch).
+    if (!g_systemTrayModuleHooked && GetSystemTrayModuleHandle() == module &&
+        module != GetTaskbarViewModuleHandle() &&
+        !g_systemTrayModuleHooked.exchange(true)) {
+        Wh_Log(L"Loaded %s", lpLibFileName);
+
+        if (HookSystemTraySymbols(module)) {
+            Wh_ApplyHookOperations();
+        }
+    }
+
     if (!g_taskbarViewDllLoaded && GetTaskbarViewModuleHandle() == module &&
         !g_taskbarViewDllLoaded.exchange(true)) {
         Wh_Log(L"Loaded %s", lpLibFileName);
 
-        if (HookTaskbarViewDllSymbols(module)) {
+        // If SystemTray.dll wasn't loaded above and this Taskbar.View.dll is an
+        // older version that hosts SystemTray symbols inline, hook them in the
+        // same batch.
+        bool hookSystemTraySymbolsInline =
+            !g_systemTrayModuleHooked &&
+            GetSystemTrayModuleHandle() == module &&
+            !g_systemTrayModuleHooked.exchange(true);
+
+        if (HookTaskbarViewDllSymbols(module, hookSystemTraySymbolsInline)) {
             Wh_ApplyHookOperations();
         }
     }
@@ -5124,7 +5315,7 @@ HMODULE WINAPI LoadLibraryExW_Hook(LPCWSTR lpLibFileName,
                                    DWORD dwFlags) {
     HMODULE module = LoadLibraryExW_Original(lpLibFileName, hFile, dwFlags);
     if (module) {
-        HandleLoadedModuleIfTaskbarView(module, lpLibFileName);
+        HandleLoadedModuleIfSystemTrayOrTaskbarView(module, lpLibFileName);
     }
 
     return module;
@@ -5267,14 +5458,45 @@ BOOL Wh_ModInit() {
         return TRUE;
     }
 
+    if (HMODULE systemTrayModule = GetSystemTrayModuleHandle()) {
+        // For older Taskbar.View.dll builds the resolved module is the same
+        // Taskbar.View.dll handle - in that case, defer hooking SystemTray
+        // symbols until HookTaskbarViewDllSymbols runs below so it can do them
+        // in a single HookSymbols batch.
+        if (systemTrayModule != GetTaskbarViewModuleHandle()) {
+            g_systemTrayModuleHooked = true;
+            if (!HookSystemTraySymbols(systemTrayModule)) {
+                return FALSE;
+            }
+        }
+    }
+
+    bool delayLoadingNeeded = false;
+
     if (HMODULE taskbarViewModule = GetTaskbarViewModuleHandle()) {
         g_taskbarViewDllLoaded = true;
-        if (!HookTaskbarViewDllSymbols(taskbarViewModule)) {
+        bool hookSystemTraySymbolsInline =
+            !g_systemTrayModuleHooked &&
+            GetSystemTrayModuleHandle() == taskbarViewModule;
+        if (hookSystemTraySymbolsInline) {
+            g_systemTrayModuleHooked = true;
+        }
+        if (!HookTaskbarViewDllSymbols(taskbarViewModule,
+                                       hookSystemTraySymbolsInline)) {
             return FALSE;
         }
     } else {
         Wh_Log(L"Taskbar view module not loaded yet");
+        delayLoadingNeeded = true;
+    }
 
+    // SystemTray.dll may load after Taskbar.View.dll on newer Windows 11
+    // builds, so make sure the LoadLibraryExW hook is installed to catch it.
+    if (!g_systemTrayModuleHooked) {
+        delayLoadingNeeded = true;
+    }
+
+    if (delayLoadingNeeded) {
         HMODULE kernelBaseModule = GetModuleHandle(L"kernelbase.dll");
         auto pKernelBaseLoadLibraryExW =
             (decltype(&LoadLibraryExW))GetProcAddress(kernelBaseModule,
@@ -5326,12 +5548,31 @@ void Wh_ModAfterInit() {
     Wh_Log(L">");
 
     if (g_target == Target::Explorer) {
+        if (!g_systemTrayModuleHooked) {
+            if (HMODULE systemTrayModule = GetSystemTrayModuleHandle()) {
+                if (systemTrayModule != GetTaskbarViewModuleHandle() &&
+                    !g_systemTrayModuleHooked.exchange(true)) {
+                    Wh_Log(L"Got system tray module");
+
+                    if (HookSystemTraySymbols(systemTrayModule)) {
+                        Wh_ApplyHookOperations();
+                    }
+                }
+            }
+        }
+
         if (!g_taskbarViewDllLoaded) {
             if (HMODULE taskbarViewModule = GetTaskbarViewModuleHandle()) {
                 if (!g_taskbarViewDllLoaded.exchange(true)) {
                     Wh_Log(L"Got Taskbar.View.dll");
 
-                    if (HookTaskbarViewDllSymbols(taskbarViewModule)) {
+                    bool hookSystemTraySymbolsInline =
+                        !g_systemTrayModuleHooked &&
+                        GetSystemTrayModuleHandle() == taskbarViewModule &&
+                        !g_systemTrayModuleHooked.exchange(true);
+
+                    if (HookTaskbarViewDllSymbols(
+                            taskbarViewModule, hookSystemTraySymbolsInline)) {
                         Wh_ApplyHookOperations();
                     }
                 }
