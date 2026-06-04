@@ -111,6 +111,20 @@ With labels:
   $description: >-
     Set to zero to use the default height value, setting a custom height can be
     useful for a customized clock with a non-standard size.
+- hideVolumeIcon: false
+  $name: Hide volume icon
+  $description: Hide the system volume icon from the tray.
+- hideNetworkIcon: false
+  $name: Hide network icon
+  $description: Hide the system network/Wi-Fi icon from the tray.
+- hideMicrophoneIcon: false
+  $name: Hide microphone icon
+  $description: >-
+    Hide the microphone privacy indicator from the tray. Note: it reappears
+    while an app is actively using the microphone.
+- hideBatteryIcon: false
+  $name: Hide battery icon
+  $description: Hide the system battery icon from the tray.
 - TaskbarItemHeight: 0
   $name: Task item height
   $description: >-
@@ -274,6 +288,10 @@ struct {
     StartMenuAlignment startMenuAlignment;
     bool startMenuAnimationAdjust;
     int clockContainerHeight;
+    bool hideVolumeIcon;
+    bool hideNetworkIcon;
+    bool hideMicrophoneIcon;
+    bool hideBatteryIcon;
     int taskbarItemHeight;
     int taskbarIconSize;
     int taskbarItemTopPadding;
@@ -1276,20 +1294,39 @@ void WINAPI SystemTrayController_UpdateFrameSize_Hook(void* pThis) {
     Wh_Log(L">");
 
     static LONG lastHeightOffset = []() -> LONG {
+        if (!SystemTrayController_UpdateFrameSize_SymbolAddress) {
+            Wh_Log(
+                L"Error: SystemTrayController_UpdateFrameSize_SymbolAddress is "
+                L"null");
+            return 0;
+        }
+
     // Find the last height offset to reset the height value.
 #if defined(_M_X64)
         // 66 0f 2e b3 b0 00 00 00 UCOMISD    uVar4,qword ptr [RBX + 0xb0]
         // 7a 4c                   JP         LAB_180075641
         // 75 4a                   JNZ        LAB_180075641
+        //
+        // Newer insider builds (first seen in 2126.5501.20.6000):
+        // 660f2e87b0000000 ucomisd xmm0, mmword ptr [rdi+0B0h]
+        // 7a02             jp      18006c931
+        // 7410             je      18006c941
+        //
+        // Newer insider builds (first seen in 2604.8002.400.0):
+        // 66 0f 2e b7 b0 00 00 00   UCOMISD    XMM6,qword ptr [RDI + 0xb0]
+        // 7a 06                     JP         LAB_1800828e3
+        // 0f 84 84 00 00 00         JZ         LAB_180082967
         const BYTE* start =
             (const BYTE*)SystemTrayController_UpdateFrameSize_SymbolAddress;
-        const BYTE* end = start + 0x200;
+        const BYTE* end = start + 0x400;
         for (const BYTE* p = start; p != end; p++) {
-            if (p[0] == 0x66 && p[1] == 0x0F && p[2] == 0x2E && p[3] == 0xB3 &&
-                p[8] == 0x7A && p[10] == 0x75) {
+            if (p[0] == 0x66 && p[1] == 0x0F && p[2] == 0x2E &&
+                (p[3] & 0xC0) == 0x80 && p[8] == 0x7A &&
+                (p[10] == 0x74 || p[10] == 0x75 ||
+                 (p[10] == 0x0F && (p[11] == 0x84 || p[11] == 0x85)))) {
                 LONG offset = *(LONG*)(p + 4);
                 Wh_Log(L"lastHeightOffset=0x%X", offset);
-                return offset;
+                return (offset < 0 || offset > 0xFFFF) ? 0 : offset;
             }
         }
 #elif defined(_M_ARM64)
@@ -1298,7 +1335,7 @@ void WINAPI SystemTrayController_UpdateFrameSize_Hook(void* pThis) {
         // 54000080 beq  [...]::UpdateFrameSize+0x6c
         const DWORD* start =
             (const DWORD*)SystemTrayController_UpdateFrameSize_SymbolAddress;
-        const DWORD* end = start + 0x80;
+        const DWORD* end = start + 0x100;
         std::regex regex1(R"(ldr\s+d\d+, \[x\d+, #0x([0-9a-f]+)\])");
         std::regex regex2(R"(fcmp\s+d\d+, d\d+)");
         std::regex regex3(R"(b\.eq\s+0x[0-9a-f]+)");
@@ -1340,7 +1377,7 @@ void WINAPI SystemTrayController_UpdateFrameSize_Hook(void* pThis) {
             // Wh_Log(L"%S", result3.text);
             LONG offset = std::stoull(match1[1], nullptr, 16);
             Wh_Log(L"lastHeightOffset=0x%X", offset);
-            return offset;
+            return (offset < 0 || offset > 0xFFFF) ? 0 : offset;
         }
 #else
 #error "Unsupported architecture"
@@ -1984,6 +2021,123 @@ void ApplySystemTrayIconContentStyle(FrameworkElement iconContent,
     }
 }
 
+enum class HideableTrayIcon {
+    kUnknown,
+    kNone,
+    kVolume,
+    kNetwork,
+    kMicrophone,
+    kMicrophoneAndGeolocation,
+};
+
+// Identify a system tray icon from its single-glyph text (Segoe Fluent Icons).
+// Codepoints taken from the "Taskbar tray system icon tweaks" mod.
+HideableTrayIcon IdentifyHideableTrayIcon(winrt::hstring const& text) {
+    if (text.size() == 0) {
+        return HideableTrayIcon::kNone;
+    }
+    if (text.size() != 1) {
+        return HideableTrayIcon::kUnknown;
+    }
+
+    unsigned int cp = (unsigned int)(unsigned short)text.c_str()[0];
+    switch (cp) {
+        case 0xE74F:
+        case 0xE992:
+        case 0xE993:
+        case 0xE994:
+        case 0xE995:
+        case 0xEA85:
+        case 0xEBC5:
+            return HideableTrayIcon::kVolume;
+
+        case 0xE709:
+        case 0xE7F4:
+        case 0xE839:
+        case 0xE86C:
+        case 0xE86D:
+        case 0xE86E:
+        case 0xE86F:
+        case 0xE870:
+        case 0xEAA1:
+        case 0xEAA2:
+        case 0xEAA3:
+        case 0xEAA4:
+        case 0xEAA5:
+        case 0xEAA8:
+        case 0xEC1E:
+        case 0xEC3C:
+        case 0xEC3D:
+        case 0xEC3E:
+        case 0xEC3F:
+        case 0xF384:
+        case 0xF8C0:
+        case 0xF8C1:
+        case 0xF8C2:
+        case 0xF8C3:
+        case 0xF8C4:
+        case 0xF8C5:
+        case 0xF8C6:
+        case 0xF8C7:
+        case 0xF8C8:
+        case 0xF8C9:
+        case 0xF8CA:
+        case 0xF8CB:
+        case 0xF8CC:
+            return HideableTrayIcon::kNetwork;
+
+        case 0xE361:
+        case 0xE720:
+        case 0xEC71:
+            return HideableTrayIcon::kMicrophone;
+
+        case 0xF47F:
+            return HideableTrayIcon::kMicrophoneAndGeolocation;
+    }
+
+    return HideableTrayIcon::kUnknown;
+}
+// Decide whether a system tray icon should be hidden based on mod settings.
+// The clock (DateTime) is never hidden here.
+bool ShouldHideSystemTrayIcon(FrameworkElement iconContent,
+                              SystemTrayIconType iconType) {
+    if (g_unloading) {
+        return false;
+    }
+
+    if (iconType == SystemTrayIconType::Battery) {
+        return g_settings.hideBatteryIcon;
+    }
+
+    if (iconType != SystemTrayIconType::Other) {
+        return false;
+    }
+
+    Controls::TextBlock innerTextBlock = nullptr;
+    FrameworkElement child = iconContent;
+    if ((child = FindChildByName(child, L"ContainerGrid")) &&
+        (child = FindChildByName(child, L"Base")) &&
+        (child = FindChildByName(child, L"InnerTextBlock"))) {
+        innerTextBlock = child.try_as<Controls::TextBlock>();
+    }
+
+    if (!innerTextBlock) {
+        return false;
+    }
+
+    switch (IdentifyHideableTrayIcon(innerTextBlock.Text())) {
+        case HideableTrayIcon::kVolume:
+            return g_settings.hideVolumeIcon;
+        case HideableTrayIcon::kNetwork:
+            return g_settings.hideNetworkIcon;
+        case HideableTrayIcon::kMicrophone:
+        case HideableTrayIcon::kMicrophoneAndGeolocation:
+            return g_settings.hideMicrophoneIcon;
+        default:
+            return false;
+    }
+}
+
 void ApplySystemTrayIconStyle(FrameworkElement systemTrayIconElement) {
     auto containerGrid =
         FindChildByName(systemTrayIconElement, L"ContainerGrid");
@@ -2032,6 +2186,13 @@ void ApplySystemTrayIconStyle(FrameworkElement systemTrayIconElement) {
     }
 
     if (!iconContent) {
+        return;
+    }
+
+    bool hide = ShouldHideSystemTrayIcon(iconContent, iconType);
+    systemTrayIconElement.Visibility(hide ? Visibility::Collapsed
+                                          : Visibility::Visible);
+    if (hide) {
         return;
     }
 
@@ -4753,6 +4914,10 @@ void LoadSettings() {
         Wh_GetIntSetting(L"startMenuAnimationAdjust");
 
     g_settings.clockContainerHeight = Wh_GetIntSetting(L"clockContainerHeight");
+    g_settings.hideVolumeIcon = Wh_GetIntSetting(L"hideVolumeIcon");
+    g_settings.hideNetworkIcon = Wh_GetIntSetting(L"hideNetworkIcon");
+    g_settings.hideMicrophoneIcon = Wh_GetIntSetting(L"hideMicrophoneIcon");
+    g_settings.hideBatteryIcon = Wh_GetIntSetting(L"hideBatteryIcon");
     g_settings.taskbarItemHeight = Wh_GetIntSetting(L"TaskbarItemHeight");
     g_settings.taskbarIconSize = Wh_GetIntSetting(L"TaskbarIconSize");
     g_settings.taskbarItemTopPadding = Wh_GetIntSetting(L"TaskbarItemTopPadding");
